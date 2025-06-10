@@ -1,259 +1,300 @@
-# inventorytracker/commands/scheduler.py
-"""
-Commands for managing scheduled tasks including low stock alerts.
+# scheduler.py
 
-This module provides CLI commands to start, stop, and monitor the scheduler
-that runs automated tasks like low stock detection.
-"""
-
-import datetime
-import time
-import signal
-import sys
-import os
-from typing import Optional, List
-from pathlib import Path
-import threading
 import asyncio
+import logging
+import time
+from datetime import datetime, time as time_of_day
+from typing import Dict, Any, List, Optional
 
-import typer
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
-from rich.text import Text
-from rich.status import Status
-from rich.live import Live
-from rich.box import ROUNDED
+from inventory_tracker.config import Config
+from inventory_tracker.notifications import send_notifications
+from inventory_tracker.inventory_analysis import detect_low_stock
 
-from ..alerts import (
-    start_scheduler, stop_scheduler, is_scheduler_running, 
-    get_next_scheduled_run, setup_scheduled_tasks, scheduled_low_stock_detection
-)
-from ..config import get_config
+logger = logging.getLogger("inventory_tracker.scheduler")
 
-# Initialize Typer command group
-scheduler_app = typer.Typer(help="Manage scheduled tasks like low stock detection")
-
-# Initialize Rich console
-console = Console()
-
-@scheduler_app.command("start")
-def start_scheduler_command(
-    foreground: bool = typer.Option(
-        False,
-        "--foreground",
-        "-f",
-        help="Run in foreground instead of as a daemon"
-    ),
-    now: bool = typer.Option(
-        False,
-        "--now",
-        "-n",
-        help="Run the scheduled detection immediately after starting"
-    ),
-    output_dir: Optional[Path] = typer.Option(
-        None,
-        "--output-dir",
-        "-o",
-        help="Directory to save reports (defaults to config setting)"
-    )
-):
+class NotificationScheduler:
     """
-    Start the scheduled task runner for automated low stock detection.
-    
-    This command starts the scheduler which will run low stock detection
-    according to the configured schedule.
+    Scheduler for running periodic inventory checks and sending notifications.
+    Supports quiet hours and notification suppression features.
     """
-    # Check if scheduler is already running
-    if is_scheduler_running():
-        console.print("[bold yellow]Scheduler is already running[/bold yellow]")
-        return
     
-    # If output_dir is not specified, get from config
-    if output_dir is None:
-        config = get_config()
-        config_dir = config.get("alerts.scheduled.output_dir")
-        if config_dir:
-            output_dir = Path(config_dir)
-
-    # Start the scheduler
-    daemon = not foreground
-    success = start_scheduler(daemon=daemon)
+    def __init__(self, config: Config):
+        """Initialize the scheduler with configuration settings."""
+        self.config = config
+        self.running = False
+        self.check_interval_seconds = config.get('scheduler.check_interval_seconds', 3600)  # Default: hourly
+        
+        # Parse quiet hours configuration (format: "22-6" for 10 PM to 6 AM)
+        self.quiet_hours_enabled = False
+        quiet_hours_config = config.get('notifications.quiet_hours', None)
+        if quiet_hours_config:
+            try:
+                start_hour, end_hour = map(int, quiet_hours_config.split('-'))
+                self.quiet_hours_start = time_of_day(hour=start_hour, minute=0)
+                self.quiet_hours_end = time_of_day(hour=end_hour, minute=0)
+                self.quiet_hours_enabled = True
+                logger.info(f"Quiet hours configured: {start_hour}:00 - {end_hour}:00")
+            except Exception as e:
+                logger.error(f"Invalid quiet_hours configuration '{quiet_hours_config}': {e}")
+        
+        # Check if notifications are globally disabled
+        self.notifications_enabled = not config.get('notifications.no_notify', False)
+        if not self.notifications_enabled:
+            logger.info("Notifications are globally disabled (--no-notify flag set)")
     
-    if not success:
-        console.print("[bold red]Failed to start scheduler - no jobs configured[/bold red]")
-        console.print("Check your configuration to ensure scheduled alerts are enabled.")
-        raise typer.Exit(code=1)
+    def is_within_quiet_hours(self) -> bool:
+        """
+        Check if the current time is within configured quiet hours.
+        
+        Returns:
+            True if current time is within quiet hours, False otherwise
+        """
+        if not self.quiet_hours_enabled:
+            return False
+            
+        current_time = datetime.now().time()
+        
+        # Handle case where quiet hours span midnight
+        if self.quiet_hours_start > self.quiet_hours_end:
+            return current_time >= self.quiet_hours_start or current_time < self.quiet_hours_end
+        else:
+            return self.quiet_hours_start <= current_time < self.quiet_hours_end
     
-    # Get the next scheduled run
-    next_run = get_next_scheduled_run()
-    
-    console.print("[bold green]Scheduler started successfully[/bold green]")
-    if next_run:
-        console.print(f"Next scheduled run: {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    # Run immediately if requested
-    if now:
-        console.print("[yellow]Running low stock detection now...[/yellow]")
-        alerts = scheduled_low_stock_detection(output_dir=output_dir)
-        console.print(f"[green]Detected {len(alerts)} products below reorder level[/green]")
-    
-    # If running in foreground, keep the process alive with status display
-    if foreground:
-        try:
-            with console.status("[bold green]Scheduler running. Press Ctrl+C to stop...[/bold green]") as status:
-                while is_scheduler_running():
-                    next_run = get_next_scheduled_run()
-                    if next_run:
-                        time_until = next_run - datetime.datetime.now()
-                        hours, remainder = divmod(time_until.total_seconds(), 3600)
-                        minutes, seconds = divmod(remainder, 60)
-                        
-                        if time_until.total_seconds() < 0:
-                            status.update("[bold yellow]Executing scheduled task now...[/bold yellow]")
-                        else:
-                            status.update(
-                                f"[bold green]Scheduler running. "
-                                f"Next run in {int(hours):02}:{int(minutes):02}:{int(seconds):02}. "
-                                f"Press Ctrl+C to stop...[/bold green]"
-                            )
-                    
-                    # Sleep briefly to avoid high CPU usage
-                    time.sleep(1)
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Stopping scheduler...[/yellow]")
-            stop_scheduler()
-            console.print("[green]Scheduler stopped[/green]")
-
-@scheduler_app.command("stop")
-def stop_scheduler_command():
-    """
-    Stop the scheduler for automated low stock detection.
-    """
-    if not is_scheduler_running():
-        console.print("[bold yellow]Scheduler is not running[/bold yellow]")
-        return
-    
-    console.print("[yellow]Stopping scheduler...[/yellow]")
-    stop_scheduler()
-    console.print("[green]Scheduler stopped successfully[/green]")
-
-@scheduler_app.command("status")
-def scheduler_status():
-    """
-    Show the current status of the scheduler and next scheduled runs.
-    """
-    is_running = is_scheduler_running()
-    
-    # Create a display table
-    table = Table(title="Scheduler Status", box=ROUNDED)
-    table.add_column("Status", style="cyan")
-    table.add_column("Value", style="green")
-    
-    # Add status row
-    if is_running:
-        table.add_row("Scheduler", "[green]Running[/green]")
-    else:
-        table.add_row("Scheduler", "[red]Stopped[/red]")
-    
-    # Add next run information if scheduler is running
-    if is_running:
-        next_run = get_next_scheduled_run()
-        if next_run:
-            time_until = next_run - datetime.datetime.now()
-            if time_until.total_seconds() < 0:
-                table.add_row("Next Run", "[yellow]Executing now...[/yellow]")
-            else:
-                hours, remainder = divmod(time_until.total_seconds(), 3600)
-                minutes, seconds = divmod(remainder, 60)
-                
-                table.add_row(
-                    "Next Run", 
-                    f"{next_run.strftime('%Y-%m-%d %H:%M:%S')} "
-                    f"({int(hours)}h {int(minutes)}m {int(seconds)}s from now)"
+    async def start(self):
+        """Start the scheduler loop."""
+        if self.running:
+            return
+            
+        self.running = True
+        logger.info("Starting notification scheduler")
+        
+        while self.running:
+            try:
+                # Run the inventory check
+                low_stock_products = await detect_low_stock(
+                    days_threshold=self.config.get('inventory.days_threshold', 14),
+                    history_days=self.config.get('inventory.history_days', 30),
+                    reorder_point_multiplier=self.config.get('inventory.reorder_point_multiplier', 1.2)
                 )
-        else:
-            table.add_row("Next Run", "[yellow]No scheduled runs[/yellow]")
+                
+                if low_stock_products:
+                    logger.info(f"Detected {len(low_stock_products)} products with low stock")
+                    
+                    # Determine if we should send notifications now
+                    should_notify = self.notifications_enabled and not self.is_within_quiet_hours()
+                    
+                    if should_notify:
+                        # Get notification types from config
+                        notification_types = self.config.get('notifications.types', ['email'])
+                        
+                        # Send notifications
+                        notification_results = await send_notifications(
+                            low_stock_products=low_stock_products,
+                            notification_types=notification_types,
+                            dry_run=False
+                        )
+                        
+                        # Log results
+                        for notifier_type, stats in notification_results.items():
+                            logger.info(f"Sent {stats['success']} {notifier_type} notifications "
+                                      f"({stats['failure']} failures)")
+                    else:
+                        reason = "notifications disabled" if not self.notifications_enabled else "quiet hours"
+                        logger.info(f"Suppressing notifications due to {reason}")
+                        
+                        # If we're in quiet hours, we might want to queue these for later
+                        if self.quiet_hours_enabled and not self.notifications_enabled:
+                            # TODO: Implement queuing of notifications for sending after quiet hours
+                            pass
+                
+                # Sleep until next check
+                await asyncio.sleep(self.check_interval_seconds)
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.exception(f"Error in scheduler loop: {e}")
+                await asyncio.sleep(60)  # Sleep for a minute before retrying on error
     
-    # Add configuration information
-    config = get_config()
-    if config.get("alerts.scheduled.enabled", False):
-        time_str = config.get("alerts.scheduled.time", "08:00")
-        days = config.get("alerts.scheduled.days", ["monday", "tuesday", "wednesday", "thursday", "friday"])
-        days_str = ", ".join(days)
-        
-        table.add_row("Scheduled Time", time_str)
-        table.add_row("Scheduled Days", days_str)
-        
-        output_dir = config.get("alerts.scheduled.output_dir")
-        if output_dir:
-            table.add_row("Report Directory", output_dir)
-        else:
-            table.add_row("Report Directory", "[yellow]Not configured[/yellow]")
-    else:
-        table.add_row("Configuration", "[red]Scheduled alerts disabled in config[/red]")
-    
-    # Display the table
-    console.print()
-    console.print(table)
-    console.print()
+    async def stop(self):
+        """Stop the scheduler loop."""
+        if not self.running:
+            return
+            
+        self.running = False
+        logger.info("Stopping notification scheduler")
 
-@scheduler_app.command("run")
-def run_now(
-    output_dir: Optional[Path] = typer.Option(
-        None,
-        "--output-dir",
-        "-o",
-        help="Directory to save reports (defaults to config setting)"
-    ),
-    notify: bool = typer.Option(
-        True,
-        "--notify/--no-notify",
-        help="Send notifications for critical items"
+
+# Configuration module to support the new options
+
+# config.py
+import argparse
+import os
+import yaml
+from typing import Dict, Any, Optional, Union
+
+class Config:
+    """
+    Configuration manager for InventoryTracker, supporting both file-based
+    configuration and command-line arguments.
+    """
+    
+    def __init__(self, config_file: Optional[str] = None):
+        """
+        Initialize configuration from file and environment variables.
+        
+        Args:
+            config_file: Optional path to configuration file
+        """
+        self.config = {}
+        self._load_defaults()
+        
+        if config_file and os.path.exists(config_file):
+            self._load_from_file(config_file)
+            
+        self._load_from_env()
+    
+    def _load_defaults(self):
+        """Load default configuration values."""
+        self.config = {
+            'scheduler': {
+                'check_interval_seconds': 3600,  # 1 hour
+            },
+            'notifications': {
+                'enabled': True,
+                'no_notify': False,
+                'types': ['email'],
+                'quiet_hours': None
+            },
+            'inventory': {
+                'days_threshold': 14,
+                'history_days': 30,
+                'reorder_point_multiplier': 1.2
+            }
+        }
+    
+    def _load_from_file(self, config_file: str):
+        """
+        Load configuration from a YAML file.
+        
+        Args:
+            config_file: Path to the configuration file
+        """
+        try:
+            with open(config_file, 'r') as f:
+                file_config = yaml.safe_load(f)
+                if file_config and isinstance(file_config, dict):
+                    # Recursively update the configuration
+                    self._deep_update(self.config, file_config)
+        except Exception as e:
+            print(f"Error loading configuration file: {e}")
+    
+    def _load_from_env(self):
+        """Load configuration from environment variables."""
+        # Handle common settings through environment variables
+        if 'INVENTORY_CHECK_INTERVAL' in os.environ:
+            try:
+                self.config['scheduler']['check_interval_seconds'] = int(os.environ['INVENTORY_CHECK_INTERVAL'])
+            except ValueError:
+                pass
+                
+        if 'INVENTORY_NO_NOTIFY' in os.environ:
+            self.config['notifications']['no_notify'] = os.environ['INVENTORY_NO_NOTIFY'].lower() in ('true', '1', 'yes')
+            
+        if 'INVENTORY_QUIET_HOURS' in os.environ:
+            self.config['notifications']['quiet_hours'] = os.environ['INVENTORY_QUIET_HOURS']
+    
+    def update_from_args(self, args: argparse.Namespace):
+        """
+        Update configuration from command-line arguments.
+        
+        Args:
+            args: Command-line arguments parsed by argparse
+        """
+        # Update config with command line arguments
+        if hasattr(args, 'no_notify') and args.no_notify:
+            self.config['notifications']['no_notify'] = True
+            
+        if hasattr(args, 'quiet_hours') and args.quiet_hours:
+            self.config['notifications']['quiet_hours'] = args.quiet_hours
+            
+        if hasattr(args, 'check_interval') and args.check_interval:
+            self.config['scheduler']['check_interval_seconds'] = args.check_interval * 60  # Convert to seconds
+            
+        if hasattr(args, 'notification_types') and args.notification_types:
+            self.config['notifications']['types'] = args.notification_types
+    
+    def _deep_update(self, base_dict: Dict[str, Any], update_dict: Dict[str, Any]):
+        """
+        Recursively update a nested dictionary.
+        
+        Args:
+            base_dict: Base dictionary to update
+            update_dict: Dictionary with updates to apply 
+        """
+        for key, value in update_dict.items():
+            if key in base_dict and isinstance(base_dict[key], dict) and isinstance(value, dict):
+                self._deep_update(base_dict[key], value)
+            else:
+                base_dict[key] = value
+    
+    def get(self, path: str, default: Any = None) -> Any:
+        """
+        Get a configuration value using a dot-separated path.
+        
+        Args:
+            path: Dot-separated path (e.g., 'notifications.quiet_hours')
+            default: Default value if path doesn't exist
+            
+        Returns:
+            Configuration value or default if not found
+        """
+        # Split the path and navigate through the config
+        parts = path.split('.')
+        current = self.config
+        
+        for part in parts:
+            if isinstance(current, dict) and part in current:
+                current = current[part]
+            else:
+                return default
+                
+        return current
+
+
+# Example usage in main application
+
+# main.py
+import asyncio
+import argparse
+import logging
+from inventory_tracker.scheduler import NotificationScheduler
+from inventory_tracker.config import Config
+
+async def main():
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="InventoryTracker")
+    parser.add_argument('--config', help='Path to configuration file')
+    parser.add_argument('--no-notify', action='store_true', help='Disable all notifications')
+    parser.add_argument('--quiet-hours', help='Set quiet hours (format: "22-6" for 10 PM to 6 AM)')
+    parser.add_argument('--check-interval', type=int, help='Check interval in minutes')
+    parser.add_argument('--notification-types', nargs='+', help='Notification types to enable')
+    
+    args = parser.parse_args()
+    
+    # Set up configuration
+    config = Config(args.config)
+    config.update_from_args(args)
+    
+    # Set up logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
-):
-    """
-    Run the low stock detection immediately without waiting for the schedule.
-    """
-    # If output_dir is not specified, get from config
-    if output_dir is None:
-        config = get_config()
-        config_dir = config.get("alerts.scheduled.output_dir")
-        if config_dir:
-            output_dir = Path(config_dir)
     
-    with console.status("[bold blue]Running low stock detection...") as status:
-        alerts = scheduled_low_stock_detection(output_dir=output_dir, notify=notify)
-    
-    # Display summary
-    critical_count = sum(1 for alert in alerts if alert.priority <= 2)
-    out_of_stock = sum(1 for alert in alerts if alert.is_out_of_stock)
-    
-    console.print()
-    console.print(f"[green]Detection completed:[/green]")
-    console.print(f"  • Total alerts: [bold]{len(alerts)}[/bold]")
-    
-    if out_of_stock > 0:
-        console.print(f"  • Out of stock: [bold red]{out_of_stock}[/bold red]")
-    else:
-        console.print(f"  • Out of stock: 0")
-    
-    if critical_count > 0:
-        console.print(f"  • Critical items: [bold yellow]{critical_count}[/bold yellow]")
-    else:
-        console.print(f"  • Critical items: 0")
-    
-    if output_dir:
-        console.print(f"  • Reports saved to: [bold cyan]{output_dir}[/bold cyan]")
-    
-    if notify and critical_count > 0:
-        console.print(f"  • Notifications sent for {critical_count} critical items")
-    
-    console.print()
+    # Create and start scheduler
+    scheduler = NotificationScheduler(config)
+    await scheduler.start()
 
-@scheduler_app.callback()
-def callback():
-    """
-    Manage scheduled tasks like low stock detection.
-    """
-    pass
+if __name__ == "__main__":
+    asyncio.run(main())
